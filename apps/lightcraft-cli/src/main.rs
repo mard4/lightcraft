@@ -10,7 +10,7 @@
 //! lightcraft-cli denoise-serve [--model ID] [--models DIR] [--listen ADDR] [--token-env VAR] [--run-on auto|gpu|cpu]
 //! lightcraft-cli commands [--json]
 //! lightcraft-cli controls [--json]
-//! lightcraft-cli calibrate [--max N] [--out DIR] FOLDERS/FILES…
+//! lightcraft-cli calibrate [--max N] [--out DIR] [--by-look] [--holdout K] FOLDERS/FILES…
 //! ```
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -102,12 +102,17 @@ USAGE:
         --max-connections N   concurrent clients (default 8)
   lightcraft-cli commands [--json]   list every command id with its parameters
   lightcraft-cli controls [--json]   list every develop control id with its range
-  lightcraft-cli calibrate [--max N] [--out DIR] FOLDERS/FILES…
+  lightcraft-cli calibrate [--max N] [--out DIR] [--by-look] [--holdout K] FOLDERS/FILES…
       Fit a colour profile per camera model from raw files and their embedded camera JPEGs
       (Sony ARW, Nikon NEF, Fujifilm RAF): up to N files spread over the folders (default 300; 0 = all), pooled per
       model, written as <model>.json to DIR (default: the profiles folder LightCraft reads,
       <config>/camera-profiles, or $LIGHTCRAFT_CAMERA_PROFILES). Raws of a profiled model then
       take their colour from the profile and only their tone from their own JPEG.
+      --by-look: pool per model and in-camera rendering (Fujifilm film simulation and tone settings) and
+      write look profiles <model>@<look>.json with their tone curves; LIGHTCRAFT_CAMERA_LOOK=<look> (or
+      `auto`) renders a photo with one instead of its own JPEG fit.
+      --holdout K: keep every K-th file out of the fit and report how close each look profile renders it
+      to its camera JPEG (mean CIE76 ΔE), next to its own JPEG fit.
   lightcraft-cli --version | --help
 ";
 
@@ -211,9 +216,14 @@ fn calibrate(args: &[String]) -> Result<(), String> {
     let mut max = 300usize;
     let mut out: Option<std::path::PathBuf> = None;
     let mut inputs = Vec::new();
+    let (mut by_look, mut holdout) = (false, 0usize);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--by-look" => by_look = true,
+            "--holdout" => {
+                holdout = take_value(args, &mut i, "--holdout")?.parse().map_err(|_| "--holdout needs a number".to_string())?;
+            }
             "--max" => max = take_value(args, &mut i, "--max")?.parse().map_err(|_| "--max needs a number".to_string())?,
             "--out" => out = Some(take_value(args, &mut i, "--out")?.into()),
             a if a.starts_with("--") => return Err(format!("unknown option `{a}`")),
@@ -235,7 +245,10 @@ fn calibrate(args: &[String]) -> Result<(), String> {
         // spread over all folders (dates, scenes) rather than the first N
         files = (0..max).filter_map(|k| files.get(k * found / max).cloned()).collect();
     }
-    eprintln!("calibrate: {} of {found} raw files", files.len());
+    let withheld: Vec<std::path::PathBuf> =
+        if holdout > 1 { files.iter().enumerate().filter(|(k, _)| k % holdout == 0).map(|(_, f)| f.clone()).collect() } else { Vec::new() };
+    files.retain(|f| !withheld.contains(f));
+    eprintln!("calibrate: {} of {found} raw files, {} withheld", files.len(), withheld.len());
     let dir = out.or_else(lightcraft_engine::camera_profiles::dir).ok_or("no profiles folder: pass --out DIR")?;
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6);
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -244,7 +257,7 @@ fn calibrate(args: &[String]) -> Result<(), String> {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut pool = lightcraft_engine::camera_profiles::Pool::default();
+                    let mut pool = new_pool(by_look);
                     while let Some(path) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         let result = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| pool.add(&bytes));
                         let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -260,24 +273,26 @@ fn calibrate(args: &[String]) -> Result<(), String> {
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    let mut pool = lightcraft_engine::camera_profiles::Pool::default();
+    let mut pool = new_pool(by_look);
     for p in pools {
         pool.merge(p);
     }
     let mut written = 0;
+    let mut fitted = Vec::new();
     for result in pool.fit(5) {
         match result {
             Ok(profile) => {
                 let path = lightcraft_engine::camera_profiles::save(&profile, &dir)?;
                 println!(
                     "{}: {} photos, {} colour pairs, hue/saturation table {} → {}",
-                    profile.model,
+                    profile.key(),
                     profile.files,
                     profile.samples,
                     profile.hue_sat.is_some(),
                     path.display()
                 );
                 written += 1;
+                fitted.push(profile);
             }
             Err(e) => eprintln!("calibrate: {e}"),
         }
@@ -290,7 +305,49 @@ fn calibrate(args: &[String]) -> Result<(), String> {
     if written == 0 {
         return Err("no profile written".into());
     }
+    if !withheld.is_empty() {
+        evaluate_withheld(&withheld, &fitted);
+    }
     Ok(())
+}
+
+fn new_pool(by_look: bool) -> lightcraft_engine::camera_profiles::Pool {
+    if by_look { lightcraft_engine::camera_profiles::Pool::by_look() } else { lightcraft_engine::camera_profiles::Pool::default() }
+}
+
+/// `calibrate --holdout`: per withheld photo, mean ΔE from its camera JPEG for its own JPEG fit and each look profile
+/// of its model (a TSV on stdout), then per look the means.
+fn evaluate_withheld(withheld: &[std::path::PathBuf], fitted: &[lightcraft_engine::camera_profiles::CameraProfile]) {
+    let looks: Vec<_> = fitted.iter().filter(|p| p.look.is_some()).collect();
+    let names: Vec<String> = looks.iter().map(|p| p.key()).collect();
+    println!("\nfile\tshot with\town fit\t{}", names.join("\t"));
+    // per shot-with look: (files, own ΔE sum, own count, per profile ΔE sums)
+    let mut totals: std::collections::BTreeMap<String, (usize, f64, usize, Vec<f64>)> = Default::default();
+    for path in withheld {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(Some(e)) = lightcraft_engine::camera_profiles::evaluate(&bytes, &looks) else {
+            eprintln!("{}: not evaluated", path.display());
+            continue;
+        };
+        let (shot, own, row) = (e.shot, e.own, e.looks);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let cells: Vec<String> = row.iter().map(|v| format!("{v:.2}")).collect();
+        println!("{name}\t{shot}\t{}\t{}", own.map_or("-".into(), |v| format!("{v:.2}")), cells.join("\t"));
+        let t = totals.entry(shot).or_insert_with(|| (0, 0.0, 0, vec![0.0; row.len()]));
+        t.0 += 1;
+        if let Some(v) = own {
+            t.1 += v;
+            t.2 += 1;
+        }
+        for (sum, v) in t.3.iter_mut().zip(&row) {
+            *sum += v;
+        }
+    }
+    println!("\nmean ΔE by look shot with\tfiles\town fit\t{}", names.join("\t"));
+    for (shot, (n, own, owns, sums)) in totals {
+        let cells: Vec<String> = sums.iter().map(|s| format!("{:.2}", s / n.max(1) as f64)).collect();
+        println!("{shot}\t{n}\t{:.2}\t{}", own / owns.max(1) as f64, cells.join("\t"));
+    }
 }
 
 fn mcp(args: &[String]) -> Result<(), String> {

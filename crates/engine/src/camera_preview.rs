@@ -112,6 +112,9 @@ pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransf
     if !transform.matrix_is_fallback || !file_local_look(raw.format) {
         return (None, false);
     }
+    if let Some(look) = selected_look(raw, bytes, transform) {
+        return (Some(look), false);
+    }
     let Some((sensor, reference, clipped)) = proxies(raw, bytes, transform, PROXY) else { return (None, false) };
     let black_and_white = monochrome(&reference);
     // A camera profile pooled from many photos knows colours this photo shows too little of;
@@ -487,6 +490,122 @@ pub(crate) fn profile_pairs(raw: &RawImage, bytes: &[u8]) -> Option<Vec<([f64; 3
 pub(crate) fn fit_profile(pairs: &[([f64; 3], [f64; 3])]) -> Option<(Mat3, Option<HsvTable>)> {
     let matrix = fit_matrix(pairs)?;
     Some((matrix, fit_hue_sat(pairs, &matrix)))
+}
+
+/// A look profile's tone and chroma curves ([`crate::camera_profiles::CameraProfile::tone`]), pooled from photos
+/// the camera rendered alike (same film simulation and tone settings), given the profile's colour. Each pair's
+/// camera RGB comes with its photo's exposure scale (`FilmLook::exposure_scale`), so the curve is that of a photo
+/// exposed at 100 % dynamic range. Both tone fits are tried; the one closer to the held-out third (in gamma-encoded
+/// luminance) is kept, then a chroma curve when it lowers the held-out error ([`fit_chroma`]).
+pub(crate) fn fit_profile_tone(pairs: &[([f64; 3], [f64; 3])], scales: &[f64], matrix: Mat3, hue_sat: Option<HsvTable>) -> Option<CameraTone> {
+    if pairs.len() != scales.len() {
+        return None;
+    }
+    let correction = hue_sat.as_ref().and_then(HueSat::new);
+    // Each photo's colour as the render computes it (the table looks up the unscaled value), then scaled to 100 %
+    // dynamic range: the tone and chroma curves are fitted on these scene colours.
+    let scene: Vec<_> = pairs
+        .iter()
+        .zip(scales)
+        .map(|((x, y), s)| {
+            let p = matrix.apply(*x);
+            let p = correction.as_ref().map_or(p, |c| c.apply(p.map(|v| v as f32)).map(f64::from));
+            (p.map(|v| v * s), *y)
+        })
+        .collect();
+    let tone_pairs: Vec<_> =
+        scene.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, (x, y))| (luma(x.map(|v| v.max(0.0))), luma(*y))).collect();
+    let encoded = |v: f64| v.max(0.0).powf(1.0 / 2.2);
+    let error = |tone: &CameraTone| -> f64 {
+        let map = ToneMap::camera(tone, 0.0, 0.0, 0.0);
+        scene.iter().step_by(3).map(|(x, y)| (encoded(luma(displayed(*x, &map))) - encoded(luma(*y))).powi(2)).sum()
+    };
+    let tone = TONE_FITS
+        .iter()
+        .filter_map(|fit| fit.fit(tone_pairs.clone()))
+        .map(|tone| (error(&tone), tone))
+        .filter(|(e, _)| e.is_finite())
+        .min_by(|a, b| a.0.total_cmp(&b.0))?
+        .1;
+    // the colour is already applied to `scene`
+    let look = CameraLook { matrix: Mat3::IDENTITY, tone, hue_sat: None };
+    Some(fit_chroma(&scene, &look).unwrap_or(tone))
+}
+
+/// The look of a look profile (colour, tone and chroma from the profile, nothing fitted to this photo's JPEG) for
+/// a photo whose raw was exposed `exposure_scale` times darker than at 100 % dynamic range.
+pub(crate) fn profile_look(profile: &crate::camera_profiles::CameraProfile, transform: &CameraTransform, exposure_scale: f64) -> Option<CameraLook> {
+    let tone = profile.tone.as_ref()?;
+    let s = exposure_scale as f32;
+    if !(s.is_finite() && s > 0.0) {
+        return None;
+    }
+    let knots = tone.knots().map(|[x, y]| [x / s, y]);
+    let tone = CameraTone::new(knots)?.with_chroma(*tone.chroma())?;
+    Some(CameraLook { matrix: profile.matrix().mul(&transform.matrix.inverse()?), tone, hue_sat: profile.hue_sat.clone() })
+}
+
+/// The look profile picked for this photo, if any: `LIGHTCRAFT_CAMERA_LOOK` names a look (`FilmLook::key`), or
+/// `auto` for the one the camera JPEG was rendered with, and the photo's model has a profile for it. A prototype
+/// switch; the app would pick it from the Profile menu.
+fn selected_look(raw: &RawImage, bytes: &[u8], transform: &CameraTransform) -> Option<CameraLook> {
+    let wanted = std::env::var("LIGHTCRAFT_CAMERA_LOOK").ok().filter(|v| !v.trim().is_empty())?;
+    let model = raw.metadata.model.as_deref()?;
+    let film = lightcraft_raw::embedded_preview_film_look(bytes);
+    let key = if wanted.trim() == "auto" { film?.key() } else { wanted.trim().to_owned() };
+    let profile = crate::camera_profiles::get_look(model, &key)?;
+    let look = profile_look(&profile, transform, film.map_or(1.0, |f| f.exposure_scale()))?;
+    if lightcraft_pipeline::profiling() {
+        eprintln!("[profile] {:?} camera look from look profile {model}@{key}", raw.format);
+    }
+    Some(look)
+}
+
+/// CIELAB (D65 white) of a linear Rec.2020 colour.
+fn lab_2020(rgb: [f64; 3]) -> [f64; 3] {
+    let xyz = REC2020.to_xyz().apply(rgb.map(|v| v.clamp(0.0, 1.0)));
+    let white = D65.to_xyz();
+    let f = |t: f64| if t > 216.0 / 24389.0 { t.cbrt() } else { (24389.0 / 27.0 * t + 16.0) / 116.0 };
+    let [fx, fy, fz] = [f(xyz[0] / white[0]), f(xyz[1] / white[1]), f(xyz[2] / white[2])];
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// How close a photo's renders come to its camera JPEG, for `lightcraft-cli calibrate --holdout`: mean CIE76 ΔE
+/// over the photo's proxy pixels (all of them, neutrals and highlights too, clipped sensor pixels left out) for its
+/// own look fitted to that JPEG (what LightCraft opens it with without a look profile; `None` when the fit is
+/// rejected) and for each of `looks` (look profiles of its model, nothing fitted to this photo).
+pub(crate) fn evaluate_looks(raw: &RawImage, bytes: &[u8], looks: &[&crate::camera_profiles::CameraProfile]) -> Option<(Option<f64>, Vec<f64>)> {
+    let transform = lightcraft_raw::color::camera_transform(raw, lightcraft_raw::color::as_shot_white_xy(raw));
+    let (sensor, reference, clipped) = proxies(raw, bytes, &transform, PROFILE_PROXY)?;
+    let sensor = without_clipped(&sensor, &clipped).unwrap_or(sensor);
+    let pairs: Vec<_> = sensor
+        .data
+        .iter()
+        .zip(&reference.data)
+        .filter(|(x, y)| x.iter().all(|v| v.is_finite() && *v > 0.0005 && *v < 1.5) && y.iter().all(|v| v.is_finite()))
+        .map(|(x, y)| (x.map(f64::from), y.map(f64::from)))
+        .collect();
+    if pairs.len() < 256 {
+        return None;
+    }
+    let delta_e = |look: &CameraLook| -> f64 {
+        let correction = look.hue_sat.as_ref().and_then(HueSat::new);
+        let map = ToneMap::camera(&look.tone, 0.0, 0.0, 0.0);
+        let sum: f64 = pairs
+            .iter()
+            .map(|(x, y)| {
+                let p = look.matrix.apply(*x);
+                let p = correction.as_ref().map_or(p, |c| c.apply(p.map(|v| v as f32)).map(f64::from));
+                let (a, b) = (lab_2020(displayed(p, &map)), lab_2020(*y));
+                (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt()
+            })
+            .sum();
+        sum / pairs.len() as f64
+    };
+    let exposure_scale = lightcraft_raw::embedded_preview_film_look(bytes).map_or(1.0, |f| f.exposure_scale());
+    let own = fit_preview(raw, bytes, &transform).0.map(|look| delta_e(&look));
+    let profiles = looks.iter().map(|p| profile_look(p, &transform, exposure_scale).map_or(f64::NAN, |look| delta_e(&look))).collect();
+    Some((own, profiles))
 }
 
 fn sensor_proxy(raw: &RawImage, k: usize, edge: usize) -> Option<Rgb32f> {

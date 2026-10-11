@@ -11,6 +11,7 @@
 //! `assets/camera-profiles/`). They are read once per process; a damaged or hostile file is
 //! ignored with a warning. They hold aggregate colour statistics only, never image content.
 use lightcraft_color::Mat3;
+use lightcraft_pipeline::tone::CameraTone;
 use lightcraft_raw::profile::HsvTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,11 +44,23 @@ pub struct CameraProfile {
     matrix: [[f64; 3]; 3],
     /// Hue/saturation/value correction after `matrix` (linear ProPhoto RGB).
     pub hue_sat: Option<HsvTable>,
+    /// For a look profile: the in-camera rendering it was pooled from (`lightcraft_raw::FilmLook::key`, a film
+    /// simulation with its tone settings), e.g. `classic-chrome_drp-strong`. `None` for the model's colour profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<String>,
+    /// A look profile's tone and chroma curves, for a raw exposed at 100 % dynamic range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<CameraTone>,
 }
 
 impl CameraProfile {
     pub fn new(model: &str, files: usize, samples: usize, matrix: Mat3, hue_sat: Option<HsvTable>) -> CameraProfile {
-        CameraProfile { version: VERSION, model: model.to_owned(), files, samples, matrix: matrix.0, hue_sat }
+        CameraProfile { version: VERSION, model: model.to_owned(), files, samples, matrix: matrix.0, hue_sat, look: None, tone: None }
+    }
+
+    /// The name the profile is stored and looked up under: the model, or `<model>@<look>` for a look profile.
+    pub fn key(&self) -> String {
+        profile_key(&self.model, self.look.as_deref())
     }
 
     pub fn matrix(&self) -> Mat3 {
@@ -62,7 +75,8 @@ impl CameraProfile {
             let len = t.hue_divisions.checked_mul(t.sat_divisions).and_then(|n| n.checked_mul(t.val_divisions));
             dims && len == Some(t.data.len()) && t.data.iter().flatten().all(|v| v.is_finite()) && t.data.iter().all(|e| e[1] >= 0.0 && e[2] >= 0.0)
         });
-        self.version == VERSION && !self.model.is_empty() && matrix && table
+        let look = self.look.as_ref().is_none_or(|l| !l.trim().is_empty()) && (self.tone.is_none() || self.look.is_some());
+        self.version == VERSION && !self.model.is_empty() && matrix && table && look
     }
 }
 
@@ -78,6 +92,14 @@ pub fn dir() -> Option<PathBuf> {
 pub fn file_name(model: &str) -> String {
     let name: String = model.trim().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     format!("{name}.json")
+}
+
+/// `model`, or `<model>@<look>` for a look profile.
+fn profile_key(model: &str, look: Option<&str>) -> String {
+    match look {
+        Some(look) => format!("{}@{}", model.trim(), look.trim()),
+        None => model.trim().to_owned(),
+    }
 }
 
 /// Read and validate a profile file.
@@ -108,7 +130,7 @@ fn bundled(model: &str) -> Option<CameraProfile> {
 /// Write `profile` to `dir` (created if needed) as `<model>.json`; returns the path.
 pub fn save(profile: &CameraProfile, dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join(file_name(&profile.model));
+    let path = dir.join(file_name(&profile.key()));
     let json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -123,20 +145,30 @@ fn cache() -> &'static Mutex<HashMap<String, Option<Arc<CameraProfile>>>> {
 
 /// The profile for camera `model`: from [`dir`], else built in; read once per process.
 pub fn get(model: &str) -> Option<Arc<CameraProfile>> {
+    get_keyed(model, None)
+}
+
+/// The look profile `look` (`lightcraft_raw::FilmLook::key`) for camera `model`, from [`dir`]; read once per process.
+pub fn get_look(model: &str, look: &str) -> Option<Arc<CameraProfile>> {
+    (!look.trim().is_empty()).then(|| get_keyed(model, Some(look))).flatten()
+}
+
+fn get_keyed(model: &str, look: Option<&str>) -> Option<Arc<CameraProfile>> {
     let model = model.trim();
     if model.is_empty() {
         return None;
     }
+    let key = profile_key(model, look);
     let mut cache = cache().lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(hit) = cache.get(model) {
+    if let Some(hit) = cache.get(&key) {
         return hit.clone();
     }
-    let path = dir().map(|d| d.join(file_name(model)));
+    let path = dir().map(|d| d.join(file_name(&key)));
     let profile = match path {
         Some(path) if path.is_file() => match load(&path) {
-            Ok(p) if p.model.trim() == model => Some(Arc::new(p)),
+            Ok(p) if p.key() == key => Some(Arc::new(p)),
             Ok(p) => {
-                eprintln!("lightcraft: ignoring camera profile {}: it is for {:?}, not {model:?}", path.display(), p.model);
+                eprintln!("lightcraft: ignoring camera profile {}: it is for {:?}, not {key:?}", path.display(), p.key());
                 None
             }
             Err(e) => {
@@ -146,8 +178,8 @@ pub fn get(model: &str) -> Option<Arc<CameraProfile>> {
         },
         _ => None,
     };
-    let profile = profile.or_else(|| bundled(model).map(Arc::new));
-    cache.insert(model.to_owned(), profile.clone());
+    let profile = if look.is_none() { profile.or_else(|| bundled(model).map(Arc::new)) } else { profile };
+    cache.insert(key, profile.clone());
     profile
 }
 
@@ -176,14 +208,43 @@ pub fn cache_key() -> u64 {
         for (model, json) in BUNDLED {
             h.str(model).str(json);
         }
+        h.str(&std::env::var("LIGHTCRAFT_CAMERA_LOOK").unwrap_or_default());
         h.finish().0 as u64
     })
 }
 
-/// Per camera model: the photos read and their pooled colour pairs.
+/// Per camera model (or model and look, [`Pool::by_look`]): the photos read and their pooled colour pairs.
 #[derive(Default)]
 pub struct Pool {
     models: HashMap<String, (usize, Vec<([f64; 3], [f64; 3])>)>,
+    /// Group photos by model and the in-camera rendering of their JPEG, and fit look profiles (with tone curves).
+    by_look: bool,
+    /// Per group, each pair's photo exposure scale (`FilmLook::exposure_scale`), for look profiles.
+    scales: HashMap<String, Vec<f64>>,
+}
+
+/// How close renders of one photo come to its camera JPEG ([`evaluate`]).
+pub struct Evaluation {
+    /// `<model>@<look>` the camera JPEG was rendered with (empty when the file doesn't say).
+    pub shot: String,
+    /// Mean CIE76 ΔE of its own look fitted to that JPEG (`None` when the fit is rejected).
+    pub own: Option<f64>,
+    /// Mean CIE76 ΔE per look profile passed in; NaN for profiles of other models.
+    pub looks: Vec<f64>,
+}
+
+/// Mean CIE76 ΔE from a photo's camera JPEG ([`crate::camera_preview::evaluate_looks`]) for its own JPEG fit and
+/// each of `looks` (look profiles; nothing fitted to this photo). `Ok(None)` when the photo can't be compared.
+pub fn evaluate(bytes: &[u8], looks: &[&CameraProfile]) -> Result<Option<Evaluation>, String> {
+    let mut raw = lightcraft_raw::decode(bytes).map_err(|e| e.to_string())?;
+    raw.opcodes.list3.retain(|op| !op.is_lens_correction());
+    let model = raw.metadata.model.as_deref().map(str::trim).unwrap_or_default().to_owned();
+    let shot = lightcraft_raw::embedded_preview_film_look(bytes).map(|f| profile_key(&model, Some(&f.key()))).unwrap_or_default();
+    let of_model: Vec<&CameraProfile> = looks.iter().copied().filter(|p| p.model.trim() == model).collect();
+    let Some((own, des)) = crate::camera_preview::evaluate_looks(&raw, bytes, &of_model) else { return Ok(None) };
+    let mut des = des.into_iter();
+    let looks = looks.iter().map(|p| if p.model.trim() == model { des.next().unwrap_or(f64::NAN) } else { f64::NAN }).collect();
+    Ok(Some(Evaluation { shot, own, looks }))
 }
 
 /// Most colour pairs kept per photo, so a few busy photos can't dominate a profile.
@@ -197,12 +258,30 @@ impl Pool {
         // colour only: geometric lens corrections would stop the sensor proxy from binning
         raw.opcodes.list3.retain(|op| !op.is_lens_correction());
         let Some(model) = raw.metadata.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) else { return Ok(None) };
+        let (key, scale) = if self.by_look {
+            let Some(film) = lightcraft_raw::embedded_preview_film_look(bytes) else { return Ok(None) };
+            (profile_key(model, Some(&film.key())), film.exposure_scale())
+        } else {
+            (model.to_owned(), 1.0)
+        };
         let Some(pairs) = crate::camera_preview::profile_pairs(&raw, bytes) else { return Ok(None) };
         let step = pairs.len().div_ceil(PAIRS_PER_FILE).max(1);
-        let entry = self.models.entry(model.to_owned()).or_default();
+        let entry = self.models.entry(key.clone()).or_default();
         entry.0 += 1;
+        let before = entry.1.len();
         entry.1.extend(pairs.into_iter().step_by(step));
-        Ok(Some(model.to_owned()))
+        if self.by_look {
+            let added = entry.1.len() - before;
+            self.scales.entry(key.clone()).or_default().extend(std::iter::repeat_n(scale, added));
+        }
+        Ok(Some(key))
+    }
+
+    /// A pool that groups photos by model and the in-camera rendering of their JPEG (film simulation and tone
+    /// settings, `lightcraft_raw::FilmLook`), and fits look profiles: colour as for a model's profile, plus the
+    /// tone and chroma curves of that rendering. Only Fujifilm RAFs record it so far.
+    pub fn by_look() -> Pool {
+        Pool { by_look: true, ..Pool::default() }
     }
 
     /// Fit a profile per model with at least `min_files` photos.
@@ -212,9 +291,18 @@ impl Pool {
         models
             .into_iter()
             .filter(|(_, (files, _))| *files >= min_files)
-            .map(|(model, (files, pairs))| {
-                let (matrix, hue_sat) = crate::camera_preview::fit_profile(pairs).ok_or_else(|| format!("{model}: no usable colour fit"))?;
-                Ok(CameraProfile::new(model, *files, pairs.len(), matrix, hue_sat))
+            .map(|(key, (files, pairs))| {
+                let (matrix, hue_sat) = crate::camera_preview::fit_profile(pairs).ok_or_else(|| format!("{key}: no usable colour fit"))?;
+                let Some((model, look)) = key.split_once('@').filter(|_| self.by_look) else {
+                    return Ok(CameraProfile::new(key, *files, pairs.len(), matrix, hue_sat));
+                };
+                let scales = self.scales.get(key).map(Vec::as_slice).unwrap_or_default();
+                let tone = crate::camera_preview::fit_profile_tone(pairs, scales, matrix, hue_sat.clone())
+                    .ok_or_else(|| format!("{key}: no usable tone curve"))?;
+                let mut profile = CameraProfile::new(model, *files, pairs.len(), matrix, hue_sat);
+                profile.look = Some(look.to_owned());
+                profile.tone = Some(tone);
+                Ok(profile)
             })
             .collect()
     }
@@ -225,6 +313,9 @@ impl Pool {
             let entry = self.models.entry(model).or_default();
             entry.0 += files;
             entry.1.extend(pairs);
+        }
+        for (key, scales) in other.scales {
+            self.scales.entry(key).or_default().extend(scales);
         }
     }
 

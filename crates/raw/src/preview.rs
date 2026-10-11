@@ -65,6 +65,141 @@ pub fn embedded_preview_dynamic_range_optimized(bytes: &[u8]) -> Option<bool> {
     crate::vendor::arw::dynamic_range_optimizer(&mn)
 }
 
+/// The in-camera rendering a Fujifilm camera JPEG was made with, from the RAF's maker note. Tag numbers and values
+/// follow the ExifTool FujiFilm tag documentation: `0x1401` FilmMode, `0x1003` Saturation (which also records the
+/// black-and-white modes), `0x1403` DevelopmentDynamicRange, `0x1443`/`0x1444` D-Range Priority, `0x1040`
+/// ShadowTone, `0x1041` HighlightTone, `0x1048` ColorChromeEffect, `0x104e` ColorChromeFXBlue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilmLook {
+    /// FilmMode (`0x1401`); `None` for the black-and-white modes, which [`FilmLook::saturation`] records.
+    pub film_mode: Option<u16>,
+    /// Saturation / Color (`0x1003`): the Color setting, or a black-and-white mode (`0x300`…`0x503`).
+    pub saturation: Option<u16>,
+    /// Development dynamic range in percent (100, 200, 400); `None` when D-Range Priority sets it.
+    pub dynamic_range: Option<u16>,
+    /// D-Range Priority: 0 off, 1 weak, 2 strong, 3 auto (`None` when the note doesn't say).
+    pub dr_priority: Option<u16>,
+    /// Shadow and highlight tone in the note's units (16 per step, negative = harder).
+    pub shadow_tone: Option<i16>,
+    pub highlight_tone: Option<i16>,
+    pub color_chrome: Option<u16>,
+    pub color_chrome_blue: Option<u16>,
+}
+
+impl FilmLook {
+    /// A short, file-name safe name of the film mode, as the maker note records it.
+    pub fn film_name(&self) -> String {
+        let bw = match self.saturation {
+            Some(0x300) => Some("bw"),
+            Some(0x301) => Some("bw-r"),
+            Some(0x302) => Some("bw-ye"),
+            Some(0x303) => Some("bw-g"),
+            Some(0x310) => Some("sepia"),
+            Some(0x500) => Some("acros"),
+            Some(0x501) => Some("acros-r"),
+            Some(0x502) => Some("acros-ye"),
+            Some(0x503) => Some("acros-g"),
+            _ => None,
+        };
+        if let Some(bw) = bw {
+            return bw.to_owned();
+        }
+        match self.film_mode {
+            Some(0x000) => "provia".into(),
+            Some(0x100) => "studio-portrait".into(),
+            Some(0x110) => "studio-portrait-ex".into(),
+            Some(0x120) => "astia".into(),
+            Some(0x130) => "studio-portrait-increased-sharpness".into(),
+            Some(0x200 | 0x400) => "velvia".into(),
+            Some(0x300) => "astia-f3".into(),
+            Some(0x500) => "pro-neg-std".into(),
+            Some(0x501) => "pro-neg-hi".into(),
+            Some(0x600) => "classic-chrome".into(),
+            Some(0x700) => "eterna".into(),
+            Some(0x800) => "classic-negative".into(),
+            Some(0x900) => "eterna-bleach-bypass".into(),
+            Some(0xa00) => "nostalgic-negative".into(),
+            Some(0xb00) => "reala-ace".into(),
+            Some(m) => format!("film-{m:x}"),
+            None => "unknown".into(),
+        }
+    }
+
+    /// The film mode with the settings that change its global tone and colour (D-Range Priority, or shadow and
+    /// highlight tone, Color, Color Chrome): photos with the same key were rendered alike, up to the dynamic range
+    /// setting, which only moves the tone curve along the exposure axis ([`FilmLook::exposure_scale`]).
+    pub fn key(&self) -> String {
+        let mut key = self.film_name();
+        match self.dr_priority {
+            Some(1) => key.push_str("_drp-weak"),
+            Some(2) => key.push_str("_drp-strong"),
+            Some(3) => key.push_str("_drp-auto"),
+            _ => {
+                let step = |v: Option<i16>| v.map_or(0, |v| -i32::from(v) / 16);
+                let (s, h) = (step(self.shadow_tone), step(self.highlight_tone));
+                if s != 0 || h != 0 {
+                    key.push_str(&format!("_h{h:+}s{s:+}"));
+                }
+            }
+        }
+        if let Some(c) = self.saturation.filter(|c| *c != 0 && !(0x300..0x600).contains(c)) {
+            key.push_str(&format!("_c{c:x}"));
+        }
+        if let Some(c) = self.color_chrome.filter(|c| *c != 0) {
+            key.push_str(&format!("_cc{c:x}"));
+        }
+        if let Some(c) = self.color_chrome_blue.filter(|c| *c != 0) {
+            key.push_str(&format!("_ccb{c:x}"));
+        }
+        key
+    }
+
+    /// How much darker the raw was exposed than at 100 % dynamic range: the camera gives DR200 one stop less
+    /// exposure and DR400 two, and lifts its tone curve to match. Scene luminance × this scale is comparable across
+    /// dynamic range settings. D-Range Priority records no dynamic range; measured on 144 X100VI photos, its tone
+    /// curves put mid grey 1.2 (weak) and 2.2 (strong) stops lower in the raw than Classic Negative at DR100 does,
+    /// so weak counts as DR200 and strong as DR400. Auto is unknown (1).
+    pub fn exposure_scale(&self) -> f64 {
+        match (self.dynamic_range, self.dr_priority) {
+            (Some(dr @ 100..=1600), _) => f64::from(dr) / 100.0,
+            (_, Some(1)) => 2.0,
+            (_, Some(2)) => 4.0,
+            _ => 1.0,
+        }
+    }
+}
+
+/// The film simulation and tone settings a Fujifilm RAF's camera JPEG was rendered with ([`FilmLook`]); `None` for
+/// other files and notes without FilmMode or Saturation.
+pub fn embedded_preview_film_look(bytes: &[u8]) -> Option<FilmLook> {
+    if !bytes.starts_with(b"FUJIFILMCCD-RAW") {
+        return None;
+    }
+    let exif = lightcraft_meta::embedded(bytes).exif?;
+    let tiff = Tiff::parse(&exif).ok()?;
+    let make = tiff.ifds.first()?.string(t::MAKE).unwrap_or_default();
+    let e = tiff.exif()?.get(t::MAKER_NOTE)?;
+    let mn = makernote::parse_makernote(&exif, e.offset, e.count() as u64, tiff.order, &make)?;
+    let ifd = &mn.ifd;
+    let signed = |tag: u16| ifd.i64(tag).and_then(|v| i16::try_from(v).ok());
+    let look = FilmLook {
+        film_mode: ifd.u16(0x1401),
+        saturation: ifd.u16(0x1003),
+        dynamic_range: ifd.u16(0x1403),
+        dr_priority: match ifd.u16(0x1443) {
+            Some(0) => Some(0),
+            Some(1) => ifd.u16(0x1444),
+            Some(2) => Some(3),
+            _ => None,
+        },
+        shadow_tone: signed(0x1040),
+        highlight_tone: signed(0x1041),
+        color_chrome: ifd.u16(0x1048),
+        color_chrome_blue: ifd.u16(0x104e),
+    };
+    (look.film_mode.is_some() || look.saturation.is_some()).then_some(look)
+}
+
 /// Whether `b` looks like a displayable (DCT) JPEG: SOI, and the first SOF marker is not lossless.
 fn is_dct_jpeg(b: &[u8]) -> bool {
     if b.len() < 4 || b[0] != 0xff || b[1] != 0xd8 {
@@ -412,6 +547,61 @@ mod tests {
         f.extend_from_slice(jpeg);
         f.extend(std::iter::repeat_n(0x33u8, gap));
         f
+    }
+
+    /// A RAF whose camera JPEG's Exif carries a Fujifilm maker note with `entries` (tag, type, value), all inline.
+    fn raf_with_film_note(entries: &[(u16, u16, u16)]) -> Vec<u8> {
+        let mut note = b"FUJIFILM".to_vec();
+        note.extend_from_slice(&12u32.to_le_bytes());
+        note.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for &(tag, ty, v) in entries {
+            note.extend_from_slice(&tag.to_le_bytes());
+            note.extend_from_slice(&ty.to_le_bytes());
+            note.extend_from_slice(&1u32.to_le_bytes());
+            note.extend_from_slice(&v.to_le_bytes());
+            note.extend_from_slice(&[0, 0]);
+        }
+        note.extend_from_slice(&[0; 4]);
+        let mut exif = IfdBuilder::new();
+        exif.set(t::MAKER_NOTE, Value::Undefined(note));
+        let mut ifd0 = IfdBuilder::new();
+        ifd0.set(t::MAKE, Value::Ascii("FUJIFILM".into()));
+        ifd0.set_child(t::EXIF_IFD, exif);
+        let tiff = TiffWriter { order: lightcraft_tiff::ByteOrder::Big, bigtiff: false }.write(&[ifd0]).unwrap();
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+        jpeg.extend_from_slice(b"Exif\0\0");
+        jpeg.extend_from_slice(&tiff);
+        jpeg.extend_from_slice(&fake_jpeg(16)[2..]);
+        raf_fixture(&jpeg, 64, 0, None)
+    }
+
+    #[test]
+    fn fujifilm_film_simulation_and_tone_settings_are_read() {
+        const SHORT: u16 = 3;
+        const SSHORT: u16 = 8;
+        // Classic Negative, Color +4, DR200, highlight -2, shadow +1, Color Chrome weak
+        let look = embedded_preview_film_look(&raf_with_film_note(&[
+            (0x1003, SHORT, 0xe0),
+            (0x1040, SSHORT, (-16i16) as u16),
+            (0x1041, SSHORT, 32),
+            (0x1048, SHORT, 32),
+            (0x1401, SHORT, 0x800),
+            (0x1403, SHORT, 200),
+        ]))
+        .unwrap();
+        assert_eq!(look.film_name(), "classic-negative");
+        assert_eq!(look.key(), "classic-negative_h-2s+1_ce0_cc20");
+        assert_eq!(look.exposure_scale(), 2.0);
+        // D-Range Priority strong replaces the tone settings in the key; Acros is a Saturation value
+        let drp = embedded_preview_film_look(&raf_with_film_note(&[(0x1401, SHORT, 0x600), (0x1443, SHORT, 1), (0x1444, SHORT, 2)])).unwrap();
+        assert_eq!(drp.key(), "classic-chrome_drp-strong");
+        assert_eq!(drp.exposure_scale(), 4.0);
+        let acros = embedded_preview_film_look(&raf_with_film_note(&[(0x1003, SHORT, 0x501), (0x1040, SSHORT, i16::MIN as u16)])).unwrap();
+        assert_eq!(acros.key(), "acros-r_h+0s+2048");
+        // not a RAF, or a note without the film tags
+        assert_eq!(embedded_preview_film_look(b"not a raw"), None);
+        assert_eq!(embedded_preview_film_look(&raf_with_film_note(&[(0x1000, SHORT, 1)])), None);
     }
 
     /// A RAF's preview pointer sits at a fixed offset, so a header-sized prefix locates it and the

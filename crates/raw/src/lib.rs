@@ -55,8 +55,8 @@ pub use lightcraft_meta::Metadata;
 pub use lightcraft_raster::Rgb32f;
 pub use opcodes::{Opcode, OpcodeLists};
 pub use preview::{
-    PREVIEW_PREFIX, PreviewColorSpace, PreviewRange, bounded_preview, embedded_preview, embedded_preview_color_space,
-    embedded_preview_dynamic_range_optimized, embedded_preview_from_range,
+    FilmLook, PREVIEW_PREFIX, PreviewColorSpace, PreviewRange, bounded_preview, embedded_preview, embedded_preview_color_space,
+    embedded_preview_dynamic_range_optimized, embedded_preview_film_look, embedded_preview_from_range,
 };
 pub use semantic::{SemanticMask, semantic_masks};
 
